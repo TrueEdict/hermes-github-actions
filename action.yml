@@ -1,0 +1,142 @@
+name: 'Hermes Action'
+description: |
+  Run Hermes Agent safely inside GitHub workflows using the official Hermes Docker image.
+author: 'TrueEdict copy of RamblerGoodness/hermes-action'
+
+branding:
+  icon: 'terminal'
+  color: 'purple'
+
+inputs:
+  prompt:
+    description: 'Task/prompt for Hermes.'
+    required: true
+  toolsets:
+    description: 'Comma-separated Hermes toolsets.'
+    required: false
+    default: 'safe,file'
+  model:
+    description: 'Optional model override.'
+    required: false
+  provider:
+    description: 'Optional provider override.'
+    required: false
+  working-directory:
+    description: 'Workspace/CWD.'
+    required: false
+    default: '.'
+  output-file:
+    description: 'Final Hermes response file.'
+    required: false
+    default: 'hermes-response.md'
+  timeout-seconds:
+    description: 'Hard timeout.'
+    required: false
+    default: '300'
+  accept-all:
+    description: 'Enable --yolo and --accept-hooks.'
+    required: false
+    default: 'false'
+  comment:
+    description: 'Opt-in comment on issue or PR.'
+    required: false
+    default: 'false'
+  hermes-docker-image:
+    description: 'Hermes Docker image.'
+    required: false
+    default: 'nousresearch/hermes-agent:latest'
+  extra-env:
+    description: 'Additional docker environment flags.'
+    required: false
+    default: ''
+
+outputs:
+  response:
+    description: 'Hermes final response.'
+  response-file:
+    description: 'Path to written response file.'
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Prepare isolated Hermes environment
+      id: prepare
+      shell: bash
+      run: |
+        set -e
+        WORKSPACE="${{ inputs.working-directory }}"
+        mkdir -p "$WORKSPACE"
+        cd "$WORKSPACE"
+        cat > /tmp/hermes-prompt.txt << 'HERMES_PROMPT_EOF'
+        ${{ inputs.prompt }}
+        HERMES_PROMPT_EOF
+        OUTPUT_FILE="${{ inputs.output-file }}"
+        touch "$OUTPUT_FILE" || true
+        HERMES_HOME_TMP="/tmp/hermes-ci-${{ github.run_id }}"
+        mkdir -p "$HERMES_HOME_TMP"
+        sudo chown -R 10000:10000 "$HERMES_HOME_TMP" 2>/dev/null || true
+        echo "hermes_workspace=$WORKSPACE" >> "$GITHUB_OUTPUT"
+        echo "hermes_prompt_file=/tmp/hermes-prompt.txt" >> "$GITHUB_OUTPUT"
+        echo "hermes_output_file=$WORKSPACE/$OUTPUT_FILE" >> "$GITHUB_OUTPUT"
+        echo "hermes_home_tmp=$HERMES_HOME_TMP" >> "$GITHUB_OUTPUT"
+
+    - name: Run Hermes
+      shell: bash
+      run: |
+        set -e
+        WORKSPACE="${{ steps.prepare.outputs.hermes_workspace }}"
+        PROMPT_FILE="${{ steps.prepare.outputs.hermes_prompt_file }}"
+        OUTPUT_FILE="${{ steps.prepare.outputs.hermes_output_file }}"
+        HERMES_HOME_TMP="${{ steps.prepare.outputs.hermes_home_tmp }}"
+        TIMEOUT="${{ inputs.timeout-seconds }}"
+        TOOLSETS="${{ inputs.toolsets }}"
+        IMAGE="${{ inputs.hermes-docker-image }}"
+        EXTRA_FLAGS="--accept-hooks"
+        if [ "${{ inputs.accept-all }}" = "true" ]; then
+          EXTRA_FLAGS="--yolo --accept-hooks"
+        fi
+        MODEL_FLAG=""
+        if [ -n "${{ inputs.model }}" ]; then
+          MODEL_FLAG="-m \"${{ inputs.model }}\""
+        fi
+        PROVIDER_FLAG=""
+        if [ -n "${{ inputs.provider }}" ]; then
+          PROVIDER_FLAG="--provider \"${{ inputs.provider }}\""
+        fi
+        timeout "$TIMEOUT" docker run --rm \
+          -v "$WORKSPACE:/workspace" \
+          -v "$HERMES_HOME_TMP:/opt/data" \
+          -v "$PROMPT_FILE:/tmp/prompt.txt:ro" \
+          -w /workspace \
+          -e HERMES_HOME=/opt/data \
+          -e HERMES_ACCEPT_HOOKS=1 \
+          -e HERMES_SOURCE=github-action \
+          ${{ inputs.extra-env }} \
+          "$IMAGE" \
+          -z "$(cat /tmp/prompt.txt)" \
+          --toolsets "$TOOLSETS" \
+          $EXTRA_FLAGS \
+          $MODEL_FLAG \
+          $PROVIDER_FLAG \
+          --ignore-user-config \
+          --source "github-action" \
+          > "$OUTPUT_FILE" 2>&1 || true
+        RESPONSE=$(head -c 8000 "$OUTPUT_FILE")
+        echo "response<<EOF" >> "$GITHUB_OUTPUT"
+        echo "$RESPONSE" >> "$GITHUB_OUTPUT"
+        echo "EOF" >> "$GITHUB_OUTPUT"
+        echo "response-file=$OUTPUT_FILE" >> "$GITHUB_OUTPUT"
+
+    - name: Upload Hermes response
+      uses: actions/upload-artifact@v4
+      with:
+        name: hermes-response-${{ github.run_id }}
+        path: ${{ steps.prepare.outputs.hermes_output_file }}
+        if-no-files-found: warn
+        retention-days: 7
+
+    - name: Cleanup
+      if: always()
+      shell: bash
+      run: |
+        rm -rf "${{ steps.prepare.outputs.hermes_home_tmp }}" 2>/dev/null || true
